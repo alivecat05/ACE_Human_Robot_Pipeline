@@ -1,0 +1,43 @@
+# Local environments and generated Python files
+.conda/
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.cache/
+.setup/
+build/
+dist/
+
+# Local credentials and device-specific settings
+.env
+.env.*
+!.env.example
+config.json
+home.json
+*.key
+*.p12
+*.pfx
+
+# Captured data and generated datasets
+outputs/
+output/
+datasets/
+processed/
+*.mcap
+*.bag
+*.svo
+*.svo2
+*.mp4
+*.avi
+*.mov
+*.jsonl
+*.parquet
+*.log
+
+# Editor/OS metadata
+.DS_Store
+Thumbs.db
+*:Zone.Identifier

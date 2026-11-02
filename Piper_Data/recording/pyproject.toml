@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "piper-capture"
+version = "0.1.0"
+description = "Record synchronized Piper RGB, state and next-state actions"
+requires-python = ">=3.12"
+dependencies = ["numpy", "scipy", "opencv-python>=4.10,<5"]
+
+[tool.setuptools.packages.find]
+include = ["piper_capture*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
