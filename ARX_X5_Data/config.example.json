@@ -1,0 +1,47 @@
+{
+  "can_doctor_url": "",
+  "save_dir": "",
+  "teleop_script": "",
+  "recorder_url": "http://127.0.0.1:8080",
+  "switch_instructions": "待现场填写：开关位置、名称与打开顺序。",
+  "switch_image": "",
+  "shutdown_instructions": "待现场核实停止、退出及断电顺序；未核实前请联系现场负责人。",
+  "channels": [
+    {
+      "name": "CAN 01",
+      "device": "待填写对应设备",
+      "success": "待填写正常状态",
+      "image": ""
+    },
+    {
+      "name": "CAN 02",
+      "device": "待填写对应设备",
+      "success": "待填写正常状态",
+      "image": ""
+    },
+    {
+      "name": "CAN 03",
+      "device": "待填写对应设备",
+      "success": "待填写正常状态",
+      "image": ""
+    },
+    {
+      "name": "CAN 04",
+      "device": "待填写对应设备",
+      "success": "待填写正常状态",
+      "image": ""
+    }
+  ],
+  "commands": {
+    "status": [],
+    "teleop_start": [],
+    "record_start": [],
+    "record_stop": [],
+    "teleop_stop": [],
+    "record_discard": []
+  },
+  "command_timeout_seconds": 30,
+  "can_doctor_command": [],
+  "can_doctor_cwd": "",
+  "visualization_python": ""
+}

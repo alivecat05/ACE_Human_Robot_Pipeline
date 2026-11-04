@@ -1,0 +1,113 @@
+--- a/test_remote_encoder.py
++++ b/test_remote_encoder.py
+@@ -4,6 +4,7 @@
+ import traceback
+ import time
+ from teleop_telemetry import Telemetry
++from teleop_exit_guard import ExitSignals, HomeExitGuard
+ 
+ # 1 3 左从 右从
+ # 2 4 左主 右主；保持 can2->can1、can4->can3 的同侧控制。
+@@ -47,7 +48,8 @@
+ 
+ 
+ def test_remote_encoder(master_left: EncoderArm, master_right: EncoderArm,
+-                        slave_left: SingleArm, slave_right: SingleArm):
++                        slave_left: SingleArm, slave_right: SingleArm,
++                        exit_requests: ExitSignals):
+     with Loading("左从臂回零"):
+         slave_left.go_home(1, wait=True)
+     with Loading("右从臂回零"):
+@@ -57,6 +59,7 @@
+     sides = (("左", master_left, slave_left, gripper_to_slave_left),
+              ("右", master_right, slave_right, gripper_to_slave_right))
+     telemetry = Telemetry()
++    exit_guard = HomeExitGuard()
+     n = 0
+     while True:
+         commands = {}
+@@ -81,15 +84,25 @@
+                 print(f"\n🛑 {name}从臂安全保护: {slave.fault}\n程序退出。")
+                 raise SystemExit(1)
+ 
++        exit_guard.observe(sides, commands, now=time.monotonic(), wall_time=time.time())
++        request = exit_requests.take_request()
++        if request:
++            if exit_guard.ready:
++                print(f"\n{request}：双臂已回正并稳定，退出遥操并进入阻尼保护。")
++                return
++            print(f"\n{request}：暂不退出。{exit_guard.reason}。"
++                  "请用示教臂手动回正双臂，稳定后再按 Ctrl+C；遥操继续。")
++
+         off = [name for name, master, *_ in sides if not master.is_online]
+         tick(n, f"⚠ {'/'.join(off)}主臂离线, 该侧从臂保持原位 (上电自动恢复)"
+-                if off else "运行中 (Ctrl+C 退出)")
++                if off else ("运行中 (已回正并稳定，Ctrl+C 可退出)" if exit_guard.ready
++                             else "运行中 (手动回正并稳定后，Ctrl+C 才能退出)"))
+         n += 1
+ 
+         time.sleep(0.01)          # ~100Hz 协调循环; 200Hz 下发在从臂控制线程里
+ 
+ 
+-if __name__ == "__main__":
++def main(exit_requests: ExitSignals):
+ 
+     # :主臂=编码器 can2/can4, 从臂=电机臂 can1/can3
+     master_left_config: Dict[str, Any] = {"can_port": "can2"}
+@@ -106,7 +119,7 @@
+         for _cfg in (slave_left_config, slave_right_config):
+             with Loading(f"连接 {_cfg['can_port']} / 初始化"):
+                 _built.append(SingleArm(_cfg))
+-    except Exception:
++    except BaseException:
+         traceback.print_exc()                
+         for _a in _built:
+             try:
+@@ -115,24 +128,29 @@
+                 pass
+         raise SystemExit(1)
+     master_left, master_right, slave_left, slave_right = _built
++    # 故障/异常仍进入保护并退出，不受回正条件限制，也不在退出时自动回零。
+     try:
+-        test_remote_encoder(master_left, master_right, slave_left, slave_right)
+-    except KeyboardInterrupt:
+-        print("\nCtrl+C -> 从臂复位并阻尼保护")
+-        for _a in (slave_left, slave_right):
+-            _a.go_home(1, wait=True)
+-        for _a in (slave_left, slave_right):
+-            _a.protect_mode()
+-        SingleArm.hold(1.0)       
+-    except SystemExit:
+-        for _a in (slave_left, slave_right):
+-            if _a.fault is None:
+-                _a.protect_mode()
+-        SingleArm.hold(1.0)
+-        raise
++        test_remote_encoder(master_left, master_right, slave_left, slave_right,
++                            exit_requests)
+     finally:
+-        for _a in _built:
++        for _a in (slave_left, slave_right):
+             try:
+-                _a.close()
++                if _a.fault is None:
++                    _a.protect_mode()
+             except Exception:
+-                pass
+\ No newline at end of file
++                traceback.print_exc()
++        try:
++            SingleArm.hold(1.0)
++        finally:
++            for _a in _built:
++                try:
++                    _a.close()
++                except Exception:
++                    traceback.print_exc()
++
++
++if __name__ == "__main__":
++    # 覆盖初始化、运行和清理；重复 Ctrl+C 不会跳过退出判定或中断清理。
++    with ExitSignals() as exit_requests:
++        print("退出规则：先用示教臂手动回正双臂，稳定 1 秒后按 Ctrl+C。")
++        main(exit_requests)

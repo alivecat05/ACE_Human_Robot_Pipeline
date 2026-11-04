@@ -1,0 +1,34 @@
+[recording]
+output = "../data/mock"
+socket = "/tmp/arx-record-mock.sock"
+fps = 30
+writer_queue_size = 8
+crf = 18
+preset = "ultrafast"
+gripper_feedback_margin_native = 0.1
+
+[sync]
+delay_ms = 100
+camera_tolerance_ms = 20
+camera_span_ms = 25
+telemetry_tolerance_ms = 20
+feedback_max_age_ms = 100
+source_timeout_s = 0.5
+
+[cameras.head]
+device = "mock-head"
+width = 320
+height = 240
+fps = 30
+
+[cameras.left_wrist]
+device = "mock-left"
+width = 320
+height = 240
+fps = 30
+
+[cameras.right_wrist]
+device = "mock-right"
+width = 320
+height = 240
+fps = 30

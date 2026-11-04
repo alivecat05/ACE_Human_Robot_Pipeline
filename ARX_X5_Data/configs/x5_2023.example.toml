@@ -1,0 +1,37 @@
+# Copy to config.local.toml and replace each camera's unique USB identifier.
+# Inspect actual YUYV formats with v4l2-ctl; index numbers may vary across boots.
+[recording]
+output = "data"
+socket = "/tmp/arx-record.sock"
+fps = 30
+writer_queue_size = 8
+crf = 18
+preset = "veryfast"
+# Measured feedback only; SDK-accepted targets remain in 0..5.
+gripper_feedback_margin_native = 0.1
+
+[sync]
+delay_ms = 100
+camera_tolerance_ms = 20
+camera_span_ms = 25
+telemetry_tolerance_ms = 20
+feedback_max_age_ms = 100
+source_timeout_s = 0.5
+
+[cameras.head]
+device = "/dev/v4l/by-id/REPLACE_WITH_D555_COLOR_NODE"
+width = 1280
+height = 800
+fps = 30
+
+[cameras.left_wrist]
+device = "/dev/v4l/by-id/REPLACE_WITH_LEFT_D405_COLOR_NODE"
+width = 1280
+height = 720
+fps = 30
+
+[cameras.right_wrist]
+device = "/dev/v4l/by-id/REPLACE_WITH_RIGHT_D405_COLOR_NODE"
+width = 1280
+height = 720
+fps = 30

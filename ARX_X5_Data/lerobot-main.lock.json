@@ -1,0 +1,8 @@
+{
+  "repository": "https://github.com/huggingface/lerobot",
+  "branch": "main",
+  "commit": "ba83e4cf43737e2665be0aafcb5f513b83c7d0f3",
+  "version": "0.6.2",
+  "python": "3.12",
+  "video_backend": "pyav"
+}

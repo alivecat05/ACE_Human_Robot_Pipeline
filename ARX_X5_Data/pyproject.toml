@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "arx-x5-data"
+version = "0.1.0"
+description = "Independent three-camera recording and LeRobot export for ARX X5 2023"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = ["numpy>=1.26,<3", "av>=15,<16", "Pillow>=10,<13"]
+
+[project.optional-dependencies]
+export = ["lerobot[dataset] @ git+https://github.com/huggingface/lerobot.git@ba83e4cf43737e2665be0aafcb5f513b83c7d0f3"]
+ui = ["nicegui>=2.24,<3"]
+dev = ["pytest>=8,<10", "ruff>=0.11", "build>=1"]
+
+[project.scripts]
+arx-x5 = "arx_x5_data.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src", "."]
+markers = ["integration: real LeRobot write/read round trip"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+extend-exclude = ["work", "outputs", ".runtime", ".demo-data"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.ruff.lint.per-file-ignores]
+# The optional dashboard embeds CSS/JavaScript and localized labels.
+"src/arx_x5_data/dashboard.py" = ["E501"]

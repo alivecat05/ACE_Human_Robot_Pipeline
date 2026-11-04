@@ -1,0 +1,2 @@
+# Patch context preserves the external source's original whitespace.
+integrations/*.patch -whitespace

@@ -1,0 +1,48 @@
+name: ARX X5 checks
+
+on:
+  push:
+    paths:
+      - 'ARX_X5_Data/**'
+      - '.github/workflows/arx-x5-checks.yml'
+  pull_request:
+    paths:
+      - 'ARX_X5_Data/**'
+      - '.github/workflows/arx-x5-checks.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    working-directory: ARX_X5_Data
+
+jobs:
+  core:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: python -m pip install -e '.[dev]'
+      - run: ruff check .
+      - run: ruff format --check .
+      - run: pytest -m 'not integration'
+      - run: node --check web/app.js && node --check web/browse.js
+      - run: python -m build
+
+  lerobot:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      - run: python -m pip install -e '.[dev,export]'
+      - run: ARX_TEST_LEROBOT=1 pytest -m integration
