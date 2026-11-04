@@ -17,15 +17,18 @@ from .robot import discover_can
 TITLE = "PiperCapture | 三视角采集"
 RECORDING_GREEN = "#087f3f"
 STOPPED_RED = "#b42318"
+WAITING_AMBER = "#a15c00"
 OPERATIONS = (
     ("r", "开始录制", "record"),
     ("s", "结束保存", "stop"),
     ("h", "设定初始位", "set_home"),
     ("g", "返回初始位", "go_home"),
     ("c", "取消返回", "cancel_home"),
+    ("d", "重新连接设备", "reconnect"),
 )
 MODES = {"warming": "设备准备中", "idle": "就绪", "recording": "录制中",
-         "saving": "保存中", "returning": "返回初始位中", "fault": "故障", "closed": "已关闭"}
+         "saving": "保存中", "returning": "返回初始位中", "fault": "故障", "closed": "已关闭",
+         "reconnecting": "重新连接设备中"}
 DROP_REASONS = {"camera_missing": "相机缺帧", "camera_reused": "相机重复帧",
                 "reference_frame_missing": "主相机缺帧",
                 "camera_span": "三视角时间差超限", "state_missing_or_stale": "当前状态缺失",
@@ -112,7 +115,9 @@ class CaptureWindow:
 
     def update_capture_indicator(self, state):
         # Use recorder state, so a rejected pedal press never displays green.
-        if state["recording"]:
+        if state["recording"] and state.get("camera_waiting"):
+            text, color = "● 相机暂时缺帧 · 等待恢复", WAITING_AMBER
+        elif state["recording"]:
             text, color = "● 正在采集", RECORDING_GREEN
         else:
             mode = state["mode"]
@@ -266,6 +271,9 @@ class CaptureWindow:
             self.root.destroy()
             return
         busy = state["recording"] or state["saving"]
+        if not self.exit_requested:
+            can_reconnect = state["mode"] in ("idle", "fault") and not self.capture.recorder.busy
+            self.buttons["d"].state(["!disabled"] if can_reconnect else ["disabled"])
         if self.was_recording and not busy:
             self.suggest_index()
         self.was_recording = busy

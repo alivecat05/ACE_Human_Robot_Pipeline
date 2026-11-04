@@ -6,7 +6,7 @@ import tkinter as tk
 
 import pytest
 
-from piper_capture.app import CaptureWindow, RECORDING_GREEN, STOPPED_RED
+from piper_capture.app import CaptureWindow, RECORDING_GREEN, STOPPED_RED, WAITING_AMBER
 from piper_capture.capture import Capture
 from test_capture import cfg, wait_mode
 
@@ -27,6 +27,30 @@ def dispose(window):
         window.root.destroy()
 
 
+def test_reconnect_button_and_camera_waiting_indicator(cfg):
+    with Capture(cfg, mock=True) as cap:
+        wait_mode(cap, "idle")
+        window = CaptureWindow(cap)
+        window.root.withdraw()
+        try:
+            old = cap.cameras
+            window.buttons["d"].invoke()
+            wait_mode(cap, "idle")
+            assert cap.cameras is not old
+            window.buttons["r"].invoke()
+            window.refresh()
+            assert window.buttons["d"].instate(["disabled"])
+            state = cap.status()
+            state["camera_waiting"] = True
+            window.update_capture_indicator(state)
+            assert window.capture_indicator.cget("background") == WAITING_AMBER
+            assert "等待恢复" in window.capture_indicator.cget("text")
+            cap.stop()
+            wait_mode(cap, "idle")
+        finally:
+            dispose(window)
+
+
 def test_native_buttons_record_save_set_home_return_cancel(cfg, tmp_path):
     cfg["topology"] = "independent"
     with Capture(cfg, mock=True, home_path=tmp_path/"home.json") as cap:
@@ -36,7 +60,7 @@ def test_native_buttons_record_save_set_home_return_cancel(cfg, tmp_path):
         try:
             assert cap.status()["mode"] == "idle", cap.status()
             assert window.capture_indicator.cget("background") == STOPPED_RED
-            assert len(window.buttons) == 6
+            assert len(window.buttons) == 7
             window.buttons["g"].invoke()
             assert "请先" in window.result_text.get()
             window.buttons["h"].invoke()
@@ -105,7 +129,7 @@ def test_shared_can_hides_home_buttons_and_ignores_their_shortcuts(cfg, tmp_path
         window = CaptureWindow(cap)
         window.root.withdraw()
         try:
-            assert set(window.buttons) == {"r", "s", "c", "q"}
+            assert set(window.buttons) == {"r", "s", "c", "d", "q"}
             for key in ("G", "H"):
                 window.on_key(SimpleNamespace(keysym=key))
             assert not cap.home_path.exists()

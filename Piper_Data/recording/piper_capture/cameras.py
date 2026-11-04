@@ -99,7 +99,14 @@ class Cameras:
                 pipe.wait_for_frames(3000)
             wall_offset = time.perf_counter() - time.time()
             while not self.stop_event.is_set():
-                frame = pipe.wait_for_frames(2000).get_color_frame()
+                # A temporary USB/DDS gap is not a dead acquisition thread.
+                # Capture's watchdog decides when an episode must be stopped.
+                available, frames = pipe.try_wait_for_frames(500)
+                if not available:
+                    continue
+                frame = frames.get_color_frame()
+                if not frame:
+                    continue
                 receive = time.perf_counter()
                 domain = frame.get_frame_timestamp_domain()
                 device_ms = frame.get_timestamp()
@@ -120,4 +127,8 @@ class Cameras:
         self.stop_event.set()
         for thread in self.threads:
             thread.join(timeout=4)
+        if any(thread.is_alive() for thread in self.threads):
+            raise RuntimeError("Camera worker did not stop; refusing to open duplicate camera connections")
+        self.context = None
+        self.histories = {name: History(90) for name in CAMERAS}
 

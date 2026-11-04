@@ -28,6 +28,8 @@ def load_config(path):
         raise ValueError("Configure two arms and three cameras")
     if not 1 <= cfg["record_hz"] <= 60 or not 30 <= cfg["poll_hz"] <= 200:
         raise ValueError("Invalid recording/poll frequency")
+    if not 0 < cfg.get("camera_recovery_s", 2.0) <= 10:
+        raise ValueError("camera_recovery_s must be in (0, 10]")
     sync = cfg["sync"]
     if min(sync.values()) <= 0 or sync["delay_ms"] < max(
             sync["camera_span_ms"], 1000/cfg["record_hz"] + sync["state_tolerance_ms"]):
@@ -53,6 +55,12 @@ class Capture:
         self.end_time = None
         self.home_job = None
         self.commanded = set()
+        self.camera_waiting = False
+        self.camera_stall_since = None
+        self.camera_recovered_since = None
+        self.recover_camera_fault = False
+        self.reconnect_thread = None
+        self.closing = False
 
     @property
     def shared_can(self):
@@ -74,7 +82,7 @@ class Capture:
             self.thread.start()
             return self
         except Exception:
-            self.close()
+            self._close_devices()
             raise
 
     def __enter__(self):
@@ -97,6 +105,34 @@ class Capture:
         return not self.cameras.errors and all(
             (item := self.cameras.histories[n].latest()) is not None
             and -.05 <= now - item.t <= self.cfg["camera_timeout_s"] for n in CAMERAS)
+
+    def _camera_diagnostics(self, now):
+        result = {}
+        for name in CAMERAS:
+            item = self.cameras.histories[name].latest()
+            result[name] = {
+                "frame_age_s": now-item.t if item else None,
+                "receive_age_s": now-item.value.get("receive_s", item.t) if item else None,
+                "frame_number": item.value.get("frame_number") if item else None,
+                "error": self.cameras.errors.get(name),
+            }
+        return result
+
+    def _event(self, event, reason):
+        # Keep diagnostics even when no episode is recording; logging must
+        # never interrupt acquisition (e.g. when the disk itself is full).
+        try:
+            path = Path(self.cfg["output"]) / "capture_events.jsonl"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if path.exists() and path.stat().st_size > 1_000_000:
+                path.replace(path.with_suffix(".previous.jsonl"))
+            row = {"time_unix_s": time.time(), "event": event, "reason": reason,
+                   "mode": self.mode, "episode": str(self.recorder.path),
+                   "cameras": self._camera_diagnostics(time.perf_counter())}
+            with path.open("a", encoding="utf-8") as stream:
+                stream.write(json.dumps(row, ensure_ascii=False) + "\n")
+        except OSError:
+            pass
 
     def _require_idle(self):
         if self.mode != "idle" or self.recorder.busy:
@@ -253,8 +289,11 @@ class Capture:
         if self.end_time is not None and now >= self.end_time + self.cfg["sync"]["delay_ms"] / 1000:
             self.recorder.stop("operator_stop", end_time=self.end_time)
 
-    def _fault(self, reason):
+    def _fault(self, reason, *, recover_camera=False):
+        self.recover_camera_fault = recover_camera
+        self.camera_recovered_since = None
         self.mode, self.message = "fault", reason
+        self._event("fault", reason)
         self.recorder.stop(reason, complete=False, end_time=time.perf_counter())
         for side in list(self.commanded):
             try:
@@ -272,8 +311,25 @@ class Capture:
                         or np.asarray(value["joints"]).shape != (6,) or not np.isfinite(value["joints"]).all()):
                     raise ValueError(f"{side}: invalid robot feedback")
                 self.states[side].add(t, value)
+        # Polling or OS scheduling can take time. Do not compare newly received
+        # frames with the time captured before polling and call them "future".
+        now = time.perf_counter()
         states = self._fresh_states(now)
         camera_ready = self._cameras_ready(now)
+        if self.mode == "fault":
+            # Only a passive camera watchdog fault is recoverable here. Never
+            # resume an interrupted episode or auto-resume commanded motion.
+            if states is not None and camera_ready and not self.recorder.busy and not self.recorder.error:
+                if self.camera_recovered_since is None:
+                    self.camera_recovered_since = now
+                if now-self.camera_recovered_since >= .5:
+                    self.camera_waiting = self.recover_camera_fault = False
+                    self.camera_stall_since = None
+                    self.mode, self.message = "idle", "相机已恢复；中断片段保留，请开始新一段采集"
+                    self._event("camera_recovered", self.message)
+            else:
+                self.camera_recovered_since = None
+            return
         if self.mode == "warming":
             if states is not None and camera_ready:
                 self.mode, self.message = "idle", "Ready; manual teaching mode is controlled on the robot"
@@ -292,15 +348,33 @@ class Capture:
             detail = "; ".join(f"{s}: {getattr(r, 'feedback_issue', '')}" for s, r in self.robots.items()
                                if getattr(r, "feedback_issue", ""))
             raise TimeoutError("Robot feedback timed out" + (f"; {detail}" if detail else ""))
-        if self.cameras.errors or not camera_ready:
-            raise TimeoutError(f"Camera feedback timed out: {self.cameras.errors}")
         if self.recorder.error:
             raise RuntimeError(self.recorder.error)
+        if self.cameras.errors or (not camera_ready and self.mode == "returning"):
+            raise TimeoutError(f"Camera feedback timed out: {self._camera_diagnostics(now)}")
+        if not camera_ready:
+            if self.camera_stall_since is None:
+                self.camera_stall_since = now
+                self._event("camera_stall", "Waiting for fresh camera frames")
+            self.camera_waiting = True
+            self.message = f"相机暂时缺帧，等待恢复：{self._camera_diagnostics(now)}"
+            if now-self.camera_stall_since >= self.cfg.get("camera_recovery_s", 2.0):
+                self._fault(f"Camera feedback timed out: {self._camera_diagnostics(now)}",
+                            recover_camera=True)
+                return
+        elif self.camera_waiting:
+            self.camera_waiting = False
+            self.camera_stall_since = None
+            self.message = "相机已恢复，继续按原始时间戳采集"
+            self._event("camera_resumed", self.message)
         if self.mode == "returning":
             self._home_tick(states, now)
         elif self.mode in ("recording", "saving"):
             if self.recorder.active:
                 self._record_tick(now)
+                # Saving must finish even if a camera never produced a frame.
+                if self.end_time is not None and now >= self.end_time + self.cfg["sync"]["delay_ms"] / 1000:
+                    self.recorder.stop("operator_stop", end_time=self.end_time)
             if self.mode == "saving" and not self.recorder.busy:
                 self.mode = "idle"
                 self.message = f"{self.recorder.result}: {self.recorder.path}"
@@ -309,7 +383,7 @@ class Capture:
         while not self.done.is_set():
             start = time.perf_counter()
             with self.lock:
-                if self.mode != "fault":
+                if self.mode != "fault" or self.recover_camera_fault:
                     try:
                         self._tick(start)
                     except Exception as error:
@@ -323,6 +397,7 @@ class Capture:
                     "home_available": self.home_available,
                     "home_unavailable_reason": "" if self.home_available else HOME_UNAVAILABLE,
                     "recording": self.mode == "recording", "saving": self.mode == "saving",
+                    "camera_waiting": self.camera_waiting,
                     "frames": self.recorder.count, "dropped": self.recorder.dropped,
                     "drop_reasons": dict(self.recorder.drop_reasons),
                     "episode": str(self.recorder.path) if self.recorder.path else None,
@@ -330,7 +405,45 @@ class Capture:
                             "feedback": {s: self.states[s].fps(now) for s in ARMS},
                             "action": self.action_rate.fps(now), "recording": self.recorder.writes.fps(now)}}
 
-    def close(self):
+    def reconnect(self):
+        with self.lock:
+            if self.closing or (self.reconnect_thread is not None and self.reconnect_thread.is_alive()):
+                raise RuntimeError("正在关闭或重新连接设备，请稍候")
+            if self.mode not in ("idle", "fault") or self.recorder.busy or self.commanded:
+                raise RuntimeError("请先结束录制并等待保存完成，再重新连接设备")
+            self._event("reconnect_requested", self.message)
+            self.mode, self.message = "reconnecting", "正在重新连接相机和机械臂反馈，请稍候"
+            self.done.set()
+            self.reconnect_thread = threading.Thread(target=self._reconnect, daemon=True,
+                                                     name="capture-reconnect")
+            self.reconnect_thread.start()
+            return self.status()
+
+    def _reconnect(self):
+        try:
+            self._close_devices()
+            with self.lock:
+                if self.closing:
+                    return
+                self.cameras = Cameras(self.cfg, self.mock)
+                self.robots = {}
+                self.states = {side: History() for side in ARMS}
+                self.recorder = Recorder(self.cfg["output"], self.cfg, self.mock)
+                self.action_rate = History()
+                self.sync = None
+                self.done = threading.Event()
+                self.thread = None
+                self.end_time = None
+                self.camera_waiting = self.recover_camera_fault = False
+                self.camera_stall_since = self.camera_recovered_since = None
+                self.mode, self.message = "warming", "重新连接后等待新鲜相机和机械臂反馈"
+            self.open()
+            self._event("reconnected", "Devices reopened; waiting for fresh feedback")
+        except Exception as error:
+            with self.lock:
+                self._fault(f"重新连接失败：{type(error).__name__}: {error}")
+
+    def _close_devices(self):
         self.done.set()
         if self.thread is not None:
             self.thread.join()
@@ -339,8 +452,22 @@ class Capture:
                 self._fault("Closed during home motion")
             if self.recorder.active:
                 self.recorder.stop("closed_before_save", complete=False, end_time=time.perf_counter())
-            self.recorder.wait()
-            self.cameras.close()
-            for robot in self.robots.values():
-                robot.close()
-            self.mode = "closed"
+        # Device shutdown may block. Keep status/GUI reads responsive while
+        # the reconnect worker waits, and attempt every device even on error.
+        self.recorder.wait()
+        errors = []
+        for device in (self.cameras, *self.robots.values()):
+            try:
+                device.close()
+            except Exception as error:
+                errors.append(f"{type(error).__name__}: {error}")
+        if errors:
+            raise RuntimeError("Device shutdown failed: " + "; ".join(errors))
+
+    def close(self):
+        self.closing = True
+        reconnect = self.reconnect_thread
+        if reconnect is not None and reconnect is not threading.current_thread():
+            reconnect.join()
+        self._close_devices()
+        self.mode = "closed"

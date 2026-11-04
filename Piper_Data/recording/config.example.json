@@ -7,6 +7,7 @@
   "foot_pedal": {"enabled": true, "device_id": "VID_0483&PID_5750", "vkey": 119, "debounce_ms": 300},
   "feedback_timeout_s": 0.2,
   "camera_timeout_s": 0.3,
+  "camera_recovery_s": 2.0,
   "home_timeout_s": 30,
   "sync": {
     "delay_ms": 80,
