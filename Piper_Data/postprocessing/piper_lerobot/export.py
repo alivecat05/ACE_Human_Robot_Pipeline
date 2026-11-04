@@ -135,6 +135,18 @@ def read_segments(source, allow_mock=False):
                 raise ValueError("Invalid timestamp")
             if abs(row[action_key] - row[stamp_key] - 1 / meta["fps"]) > 1e-6:
                 raise ValueError("Action must refer to the next grid tick")
+            if meta.get("sampling_timeline") == "head_camera_timestamps":
+                sources = row[source_key]
+                camera_times = [sources["cameras"][name] for name in CAMERAS]
+                if (not np.isfinite(camera_times).all()
+                        or abs(sources["cameras"]["head"]-row[stamp_key]) > 1e-6
+                        or max(camera_times)-min(camera_times) > cfg["sync"]["camera_span_ms"]/1000+1e-6):
+                    raise ValueError("Camera timestamps are not aligned")
+                tolerance = cfg["sync"]["state_tolerance_ms"]/1000+1e-6
+                for kind, target in (("states", row[stamp_key]), ("actions", row[action_key])):
+                    if any(not np.isfinite(stamp) or abs(stamp-target) > tolerance
+                           for side in ARMS for stamp in sources[kind][side].values()):
+                        raise ValueError(f"Robot {kind} timestamps are not aligned")
             if any(not np.isfinite(stamp) or stamp <= row[stamp_key] for s in ARMS
                    for field, stamp in row[source_key]["actions"][s].items()
                    if field in ("tcp", "gripper") or field.startswith("end_pose_")):
@@ -146,9 +158,19 @@ def read_segments(source, allow_mock=False):
                 value = np.asarray(row[key])
                 if value.shape != (16,) or not np.isfinite(value).all():
                     raise ValueError(f"Invalid {key} in {path}")
-            if current and abs((row[stamp_key] - current[-1][stamp_key])
-                               - 1 / meta["fps"]) > .002:
-                raise ValueError("Timestamp/grid mismatch")
+            if current:
+                delta = row[stamp_key] - current[-1][stamp_key]
+                if meta.get("sampling_timeline") == "head_camera_timestamps":
+                    # Real frame timestamps include acquisition jitter. Keep
+                    # them intact; split actual time gaps instead of pretending
+                    # the original capture ran on an exact wall-clock grid.
+                    if delta <= 0:
+                        raise ValueError("Camera timestamps must increase")
+                    if abs(delta - 1 / meta["fps"]) > .5 / meta["fps"]:
+                        segments.append(current)
+                        current = []
+                elif abs(delta - 1 / meta["fps"]) > .002:
+                    raise ValueError("Timestamp/grid mismatch")
             current.append(row)
         if current:
             segments.append(current)

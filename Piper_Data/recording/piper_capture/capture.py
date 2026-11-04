@@ -14,7 +14,7 @@ from .recording import Recorder
 from .robot import MockPiperX, PiperX
 
 SHARED_CAN = "leader_follower_shared_can"
-HOME_UNAVAILABLE = "当前为主从共用 CAN：尚未实现主从返回自定义初始位，未发送运动命令"
+HOME_UNAVAILABLE = ""
 
 
 def load_config(path):
@@ -30,7 +30,7 @@ def load_config(path):
         raise ValueError("Invalid recording/poll frequency")
     sync = cfg["sync"]
     if min(sync.values()) <= 0 or sync["delay_ms"] < max(
-            sync["camera_tolerance_ms"], 1000/cfg["record_hz"] + sync["state_tolerance_ms"]):
+            sync["camera_span_ms"], 1000/cfg["record_hz"] + sync["state_tolerance_ms"]):
         raise ValueError("Sync delay must cover RGB matching and next-step action tolerance")
     for arm in cfg["arms"].values():
         if not 1 <= arm["home_speed_percent"] <= 20:
@@ -119,6 +119,7 @@ class Capture:
                                      1 / self.cfg["record_hz"])
             self.action_rate = History()
             self.start_time, self.grid, self.end_time = time.perf_counter(), 0, None
+            self.reference_first_number = self.reference_last_number = None
             self.recorder.start(self.start_time, task=task, capture_index=capture_index)
             self.cfg["task"] = task
             self.mode, self.message = "recording", "Recording manual demonstration"
@@ -214,7 +215,30 @@ class Capture:
         limit = now - self.cfg["sync"]["delay_ms"] / 1000
         if self.end_time is not None:
             limit = min(limit, self.end_time)
-        while (t := self.start_time + self.grid / self.cfg["record_hz"]) <= limit:
+        # Crop to the streams' common time interval and use the reference
+        # camera's actual timestamps. Clicking at a different clock phase must
+        # not change which otherwise valid RGB groups can be recorded.
+        histories = {n: self.cameras.histories[n].snapshot() for n in CAMERAS}
+        if not all(histories.values()):
+            return
+        overlap_start = max(self.start_time, max(items[0].t for items in histories.values()))
+        overlap_end = min(limit, min(items[-1].t for items in histories.values()))
+        for frame in histories[CAMERAS[0]]:
+            t, number = frame.t, frame.value["frame_number"]
+            if t < overlap_start or t > overlap_end:
+                continue
+            if self.reference_last_number is not None and number <= self.reference_last_number:
+                continue
+            if self.reference_first_number is None:
+                self.reference_first_number = number
+            self.reference_last_number = number
+            index = int((number-self.reference_first_number) * self.cfg["record_hz"]
+                        / self.cfg["cameras"][CAMERAS[0]]["fps"])
+            if index < self.grid:
+                continue  # Intentional downsampling when record_hz is lower.
+            if index > self.grid:
+                self.recorder.drop("reference_frame_missing", index-self.grid)
+            self.grid = index
             if self.end_time is not None and t + 1/self.cfg["record_hz"] > self.end_time:
                 self.recorder.drop("episode_end")
                 self.grid += 1

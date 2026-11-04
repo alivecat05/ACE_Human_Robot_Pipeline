@@ -11,9 +11,12 @@ import numpy as np
 from .cameras import discover
 from .capture import Capture, load_config
 from .core import CAMERAS
+from .pedal import RawPedal, diagnose
 from .robot import discover_can
 
 TITLE = "PiperCapture | 三视角采集"
+RECORDING_GREEN = "#087f3f"
+STOPPED_RED = "#b42318"
 OPERATIONS = (
     ("r", "开始录制", "record"),
     ("s", "结束保存", "stop"),
@@ -24,6 +27,7 @@ OPERATIONS = (
 MODES = {"warming": "设备准备中", "idle": "就绪", "recording": "录制中",
          "saving": "保存中", "returning": "返回初始位中", "fault": "故障", "closed": "已关闭"}
 DROP_REASONS = {"camera_missing": "相机缺帧", "camera_reused": "相机重复帧",
+                "reference_frame_missing": "主相机缺帧",
                 "camera_span": "三视角时间差超限", "state_missing_or_stale": "当前状态缺失",
                 "action_missing_or_stale": "下一时刻action缺失", "episode_end": "正常尾帧舍弃"}
 
@@ -43,7 +47,7 @@ def render_views(capture, width, height):
             image = cv2.resize(image, None, fx=scale, fy=scale)
             y, x = 40 + (height-40-image.shape[0]) // 2, (tile_width-image.shape[1]) // 2
             tile[y:y+image.shape[0], x:x+image.shape[1]] = image
-        cv2.putText(tile, f"{name}  {state['fps']['cameras'][name]:.1f} FPS", (12, 27),
+        cv2.putText(tile, f"{name}  {state['fps']['cameras'][name]:.2f} FPS", (12, 27),
                     cv2.FONT_HERSHEY_SIMPLEX, .65, (240, 240, 240), 2)
         tiles.append(tile)
     return np.hstack(tiles)
@@ -54,17 +58,24 @@ class CaptureWindow:
         self.capture = capture
         self.root = tk.Tk()
         self.root.title(TITLE)
-        self.root.geometry("1440x540")
-        self.root.minsize(960, 420)
+        self.root.geometry("1440x640")
+        self.root.minsize(960, 520)
         self.closed = self.exit_requested = False
         self.timer = None
         self.photo = None
+        self.pedal = None
+        self.pedal_text = tk.StringVar(master=self.root, value="脚踏未启用 | 可使用界面按钮采集")
         self.status_text, self.device_text, self.result_text = (tk.StringVar(master=self.root) for _ in range(3))
+        self.capture_indicator = tk.Label(
+            self.root, text="● 未在采集", background=STOPPED_RED, foreground="white",
+            font=("Microsoft YaHei UI", 28, "bold"), pady=12, borderwidth=0)
+        self.capture_indicator.pack(side="top", fill="x")
         panel = ttk.Frame(self.root, padding=10)
         panel.pack(side="bottom", fill="x")
         ttk.Label(panel, textvariable=self.status_text, font=("Microsoft YaHei UI", 12)).pack(anchor="w")
         ttk.Label(panel, textvariable=self.device_text).pack(anchor="w", pady=4)
         ttk.Label(panel, textvariable=self.result_text, foreground="#005a9e").pack(anchor="w", pady=4)
+        ttk.Label(panel, textvariable=self.pedal_text).pack(anchor="w")
         task_bar = ttk.Frame(panel)
         task_bar.pack(fill="x", pady=4)
         self.task_name = tk.StringVar(master=self.root, value=capture.cfg["task"])
@@ -81,23 +92,100 @@ class CaptureWindow:
         bar.pack(fill="x", pady=5)
         self.buttons = {}
         for key, label, _ in OPERATIONS:
-            if capture.shared_can and not capture.mock:
-                label = {"h": "保存从臂参考位", "g": "主从自定义回位未接入"}.get(key, label)
+            if capture.shared_can and key in ("h", "g"):
+                continue
             button = ttk.Button(bar, text=label, command=lambda k=key: self.perform(k))
             button.pack(side="left", expand=True, fill="x", padx=4, ipady=8)
             self.buttons[key] = button
-        if not capture.home_available:
+        if not capture.home_available and "g" in self.buttons:
             self.buttons["g"].state(["disabled"])
             self.result_text.set(capture.status()["home_unavailable_reason"])
         self.buttons["q"] = ttk.Button(bar, text="退出", command=self.request_close)
         self.buttons["q"].pack(side="left", expand=True, fill="x", padx=4, ipady=8)
-        ttk.Label(panel, text="返回初始位前请松手并清空运动路径；R/S/H/G/C/Q 快捷键仍可在此窗口使用。"
-                  ).pack(anchor="w")
         self.views = tk.Label(self.root, background="black", borderwidth=0)
         self.views.pack(side="top", expand=True, fill="both")
         self.root.bind("<KeyPress>", self.on_key)
+        self.root.bind("<Destroy>", self.on_destroy)
         self.root.protocol("WM_DELETE_WINDOW", self.request_close)
+        self.start_pedal()
         self.refresh()
+
+    def update_capture_indicator(self, state):
+        # Use recorder state, so a rejected pedal press never displays green.
+        if state["recording"]:
+            text, color = "● 正在采集", RECORDING_GREEN
+        else:
+            mode = state["mode"]
+            if mode == "saving":
+                text = "● 已停止采集 · 正在保存"
+            elif mode == "fault":
+                text = "● 采集故障 · 已停止"
+            elif mode == "idle":
+                text = "● 已停止采集 · 就绪"
+            else:
+                text = f"● 未在采集 · {MODES.get(mode, mode)}"
+            color = STOPPED_RED
+        self.capture_indicator.configure(text=text, background=color)
+
+    def start_pedal(self):
+        settings = self.capture.cfg.get("foot_pedal", {})
+        if not settings.get("enabled", False):
+            return
+        try:
+            self.pedal = RawPedal(settings.get("device_id", ""),
+                                  settings.get("debounce_ms", 300), settings.get("vkey", 119))
+            self.pedal.start()
+            self.pedal_text.set("正在检测脚踏")
+        except Exception as error:
+            self.close_pedal()
+            self.pedal_text.set(f"脚踏不可用：{error}；可使用录制按钮")
+
+    def close_pedal(self):
+        if self.pedal is not None:
+            pedal = self.pedal
+            self.pedal = None
+            try:
+                pedal.close()
+            except Exception as error:
+                self.pedal_text.set(f"脚踏关闭失败：{error}；可使用录制按钮")
+
+    def on_destroy(self, event):
+        if event.widget is self.root:
+            self.close_pedal()
+
+    def poll_pedal(self):
+        if self.pedal is None:
+            return
+        try:
+            events = self.pedal.poll()
+        except Exception as error:
+            self.close_pedal()
+            self.pedal_text.set(f"脚踏不可用：{error}；可使用录制按钮")
+            return
+        for kind, value in events:
+            if kind == "status":
+                hint = "踩一次开始，再踩一次结束保存" if value == "脚踏已连接" else "可使用界面按钮采集"
+                self.pedal_text.set(f"{value} | {hint}")
+            elif kind == "error":
+                self.pedal_text.set(f"脚踏错误：{value}；可使用录制按钮")
+            elif kind == "press":
+                self.toggle_recording()
+
+    def toggle_recording(self):
+        if self.exit_requested:
+            return
+        state = self.capture.status()
+        if state["recording"]:
+            self.perform("s")
+        elif state["saving"]:
+            self.result_text.set("正在保存，请稍候；保存完成后再踩脚踏开始下一段")
+        elif state["mode"] == "idle":
+            if self.was_recording:
+                self.suggest_index()
+                self.was_recording = False
+            self.perform("r")
+        else:
+            self.result_text.set(f"脚踏未执行：当前{MODES.get(state['mode'], state['mode'])}")
 
     def suggest_index(self, *args):
         try:
@@ -147,6 +235,7 @@ class CaptureWindow:
                 self.result_text.set("未执行：请先点击“设定初始位”")
             except Exception as error:
                 self.result_text.set(f"未执行“{label}”：{error}")
+            self.update_capture_indicator(self.capture.status())
             print(self.result_text.get(), flush=True)
             return
 
@@ -159,6 +248,7 @@ class CaptureWindow:
         if state["recording"]:
             self.capture.stop()
         self.exit_requested = True
+        self.update_capture_indicator(self.capture.status())
         self.result_text.set("正在保存并退出，请稍候")
         for button in self.buttons.values():
             button.state(["disabled"])
@@ -166,7 +256,9 @@ class CaptureWindow:
     def refresh(self):
         if self.closed:
             return
+        self.poll_pedal()
         state = self.capture.status()
+        self.update_capture_indicator(state)
         if self.exit_requested and not state["saving"]:
             self.closed = True
             if self.timer is not None:
@@ -181,12 +273,12 @@ class CaptureWindow:
         entry_state = "disabled" if state["recording"] or state["saving"] or self.exit_requested else "normal"
         for entry in (self.task_entry, self.capture_index_entry):
             entry.configure(state=entry_state)
-        self.status_text.set(f"{MODES.get(state['mode'], state['mode'])}  |  action {fps['action']:.1f} Hz"
-                             f"  |  写盘 {fps['recording']:.1f} FPS  |  已保存 {state['frames']} 帧"
+        self.status_text.set(f"{MODES.get(state['mode'], state['mode'])}  |  action {fps['action']:.2f} Hz"
+                             f"  |  写盘 {fps['recording']:.2f} FPS  |  已保存 {state['frames']} 帧"
                              f"  |  丢帧 {state['dropped']}")
         reasons = ", ".join(f"{DROP_REASONS.get(k.split(':')[0], k)} {v}"
                             for k, v in state["drop_reasons"].items())
-        self.device_text.set(f"双臂反馈 {fps['feedback']['left']:.1f}/{fps['feedback']['right']:.1f} Hz"
+        self.device_text.set(f"双臂反馈 {fps['feedback']['left']:.2f}/{fps['feedback']['right']:.2f} Hz"
                              f"  |  {state['message']}" + (f"  |  {reasons}" if reasons else ""))
         image = render_views(self.capture, self.views.winfo_width(), self.views.winfo_height())
         rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
@@ -196,14 +288,18 @@ class CaptureWindow:
         self.timer = self.root.after(33, self.refresh)
 
     def run(self):
-        self.root.mainloop()
+        try:
+            self.root.mainloop()
+        finally:
+            self.close_pedal()
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", nargs="?", choices=("run", "discover", "discover-arms"), default="run")
+    parser.add_argument("command", nargs="?", choices=("run", "discover", "discover-arms", "discover-pedal"), default="run")
     parser.add_argument("--config", default=Path(__file__).resolve().parents[1] / "config.json")
     parser.add_argument("--mock", action="store_true")
+    parser.add_argument("--pedal-seconds", type=int, default=30, help="脚踏诊断监听秒数（默认 30）")
     args = parser.parse_args()
     if args.command == "discover-arms":
         devices = discover_can()
@@ -211,6 +307,11 @@ def main():
         print(json.dumps(devices, indent=2, ensure_ascii=False))
         return
     cfg = load_config(args.config)
+    if args.command == "discover-pedal":
+        settings = cfg.get("foot_pedal", {})
+        diagnose(settings.get("device_id", "VID_0483&PID_5750"), max(1, args.pedal_seconds),
+                 settings.get("vkey", 119))
+        return
     if args.command == "discover":
         print(json.dumps(discover(cfg["realsense"]), indent=2))
         return

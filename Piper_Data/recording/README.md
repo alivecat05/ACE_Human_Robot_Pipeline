@@ -14,10 +14,56 @@ python recording/record.py --mock
 
 也可在本目录运行 `python record.py`。Windows 自动安装后可运行本目录 `run.cmd`。
 默认配置固定在本目录，配置内相对输出路径以配置文件所在目录为基准。
+相机 FPS、写盘 FPS 以及双臂反馈频率均显示两位小数。
+当前主从共线接法不显示“保存从臂参考位”“主从自定义回位未接入”按钮及底部回位快捷键提示。
 
-同步流程：`cameras.py` / `robot.py` 采样 → `synchronization.py` 匹配 →
+## USB 脚踏
+
+脚踏是可选设备。没有脚踏时，无需修改配置，直接点击界面的“开始录制”和“结束保存”即可采集。
+旧配置未包含 `foot_pedal`、脚踏被禁用、未连接或监听失败时，界面采集功能仍可正常使用。
+
+窗口顶部整条状态栏显示实际采集状态：绿色“正在采集”，结束录制立即切换为红色“已停止采集 · 正在保存”，
+保存完成后显示红色“已停止采集 · 就绪”。脚踏、界面按钮和快捷键操作都会同步更新；采集故障时也会切换为红色提示。
+
+Windows 下已接入当前 USB 脚踏（`VID_0483&PID_5750`，实测发送 F8）：
+踩一次开始录制，再踩一次结束保存。保存完成后，再踩开始下一段，采集序号自动递增。
+长按只触发一次，300 ms 内的抖动会被忽略；保存中、设备未就绪或返回初始位时不会开始新录制。
+
+启动后可在界面查看“脚踏已连接 / 脚踏未连接”。监听按 USB 设备和按键同时过滤，
+普通键盘的 F8 不会触发录制；录制窗口在后台、或光标在任务名输入框时仍可使用脚踏。
+脚踏拔出后可重新插入，程序会重新检测；录制过程中的拔出不会自动结束当前录制，可点击“结束保存”。
+
+`config.json` 和示例配置中包含：
+
+```json
+"foot_pedal": {
+  "enabled": true,
+  "device_id": "VID_0483&PID_5750",
+  "vkey": 119,
+  "debounce_ms": 300
+}
+```
+
+`119` 是 F8 的 Windows 虚拟键码。不使用脚踏时可将 `enabled` 改为 `false` 来关闭监听，也可保持现有配置。
+此功能使用 Windows 自带输入接口，无需额外安装 Python 包。
+
+单独检测连接和踩踏事件（不连接相机、机械臂，也不录制），从项目根目录运行：
+
+```powershell
+.\recording\run.cmd discover-pedal
+# 指定监听时长：
+.\recording\run.cmd discover-pedal --pedal-seconds 60
+```
+
+诊断会列出键盘输入设备，只输出配置匹配的脚踏事件；`key` 表示踩下/松开，
+`press` 表示一次有效踩踏。
+
+同步流程：`cameras.py` / `robot.py` 采样 → `synchronization.py` 按 head 实际图像时间戳匹配三路图像、当前状态及下一时刻 action →
 `capture.py` 提交整组 → `recording.py` 同时写入三路视频和对应数据行。
 结束保存后，视频已按帧对齐，后处理无需再同步。
+先取三路相机的公共时间区间；`camera_span_ms` 限制三路互差，`state_tolerance_ms` 限制当前状态及 action 的匹配误差。
+不再使用原先相机相对固定网格的 `camera_tolerance_ms` 条件；旧配置中的该字段可以保留，但不参与匹配。
+样本时间等于 head 实际时间；action 目标时间为样本时间加 `1 / record_hz` 秒，各字段的实际反馈时间也会逐一保存。
 
 默认输出 `outputs/任务名/episode_序号/`，包含三个 MP4、`action.csv`、
 `samples.jsonl`、`manifest.json`。时间戳容差、丢帧规则和 action 定义见上层说明。

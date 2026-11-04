@@ -93,6 +93,39 @@ def test_mismatched_csv_is_rejected(cfg):
         read_segments(path, allow_mock=True)
 
 
+def test_camera_timestamp_jitter_is_preserved_and_old_grid_contract_stays_strict(cfg):
+    start = time.perf_counter()
+    recorder = Recorder(cfg["output"], cfg, mock=True)
+    recorder.start(start)
+    for number, jitter in enumerate((0, .003, -.001, .002)):
+        recorder.add(sample(cfg, start+number/30+jitter, number), number)
+    recorder.stop(end_time=start+.2)
+    assert recorder.wait(5) and recorder.result == "complete"
+    segments = read_segments(recorder.path, allow_mock=True)
+    assert len(segments) == 1 and len(segments[0][2]) == 4
+    actual = [row["timestamp_unix_s"] for row in segments[0][2]]
+    assert actual[1]-actual[0] == pytest.approx(1/30+.003, abs=1e-6)
+    path = recorder.path/"manifest.json"
+    meta = json.loads(path.read_text())
+    meta.pop("sampling_timeline")
+    path.write_text(json.dumps(meta))
+    with pytest.raises(ValueError, match="Timestamp/grid mismatch"):
+        read_segments(recorder.path, allow_mock=True)
+
+
+@pytest.mark.parametrize("source", ["cameras", "states", "actions"])
+def test_camera_timeline_export_checks_images_current_state_and_action_alignment(cfg, source):
+    path, rows, _ = record_episode(cfg, (0, 1))
+    stamps = rows[0]["source_timestamps_unix_s"][source]
+    if source == "cameras":
+        stamps["right_wrist"] += .05
+    else:
+        stamps["left"]["tcp"] += .05
+    (path/"samples.jsonl").write_text("".join(json.dumps(row)+"\n" for row in rows))
+    with pytest.raises(ValueError, match="timestamps are not aligned"):
+        read_segments(path, allow_mock=True)
+
+
 def test_task_folders_increment_and_export_recursively(cfg):
     cfg["task"] = "把杯子放入托盘"
     first, _, _ = record_episode(cfg, (0, 1))

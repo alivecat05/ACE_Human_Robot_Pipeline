@@ -39,7 +39,7 @@ def test_skewed_cameras_and_a_missing_frame_stay_aligned_on_disk(cfg):
     assert recorder.wait(5)
     assert recorder.result == "complete", recorder.error
     assert recorder.count == 4
-    assert recorder.drop_reasons == {"camera_missing:right_wrist": 1}
+    assert recorder.drop_reasons == {"camera_reused:right_wrist": 1}
     rows = [json.loads(line) for line in (recorder.path / "samples.jsonl").read_text().splitlines()]
     assert [row["grid_index"] for row in rows] == [0, 1, 3, 4]
     with (recorder.path / "action.csv").open() as file:

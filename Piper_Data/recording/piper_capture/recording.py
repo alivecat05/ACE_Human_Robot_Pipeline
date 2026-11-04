@@ -99,10 +99,10 @@ class Recorder:
             self.error = "Episode writer queue full; disk cannot sustain recording"
             raise RuntimeError(self.error) from error
 
-    def drop(self, reason):
-        self.dropped += 1
-        self.drop_reasons[reason] += 1
-        self.missing_run += 1
+    def drop(self, reason, count=1):
+        self.dropped += count
+        self.drop_reasons[reason] += count
+        self.missing_run += count
         self.longest_missing_run = max(self.longest_missing_run, self.missing_run)
 
     def _disk_row(self, sample, grid_index):
@@ -227,6 +227,7 @@ class Recorder:
             "drop_reasons": dict(self.drop_reasons),
             "longest_missing_run_s": self.longest_missing_run / self.config_snapshot["record_hz"],
             "fps": self.config_snapshot["record_hz"], "storage_layout": "task/capture_index",
+            "sampling_timeline": "head_camera_timestamps",
             "start_unix_s": self.start_time + self.unix_offset,
             "end_unix_s": self.end_time + self.unix_offset if self.end_time is not None else None,
             "timestamp_clock": "Unix seconds; fixed mapping from monotonic clock at episode start",

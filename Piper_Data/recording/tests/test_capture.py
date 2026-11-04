@@ -15,6 +15,7 @@ from piper_capture.robot import MockPiperX
 def cfg(tmp_path):
     cfg = load_config(Path(__file__).resolve().parents[1] / "config.example.json")
     cfg["output"] = str(tmp_path / "episodes")
+    cfg["foot_pedal"]["enabled"] = False  # Tests must not react to the operator's USB pedal.
     for camera in cfg["cameras"].values():
         camera.update(width=64, height=48)
     return cfg
@@ -94,7 +95,7 @@ def test_synchronizer_rejects_stale_fields_span_and_duplicate(cfg):
     add_state(states, 2)
     add_state(states, 2+1/30)
     assert sync.sample(2) is None
-    assert sync.rejection == "camera_span"
+    assert sync.rejection.startswith("camera_span")
 
 
 def test_joint_matching_avoids_long_gap_from_camera_phase(cfg):
@@ -117,6 +118,42 @@ def test_joint_matching_avoids_long_gap_from_camera_phase(cfg):
         for n in CAMERAS:
             ids[n].append(row["camera_metadata"][n]["frame_number"])
     assert all(len(set(v)) == 200 for v in ids.values())
+
+
+@pytest.mark.parametrize("head_offset,left_offset,right_offset", [(.0116, .0131, .0063),
+                                                                (-.0082, .0137, .0070)])
+def test_actual_camera_timeline_avoids_long_blackouts_and_aligns_actions(
+        cfg, head_offset, left_offset, right_offset):
+    # The phases and ~30 vs ~29.993 FPS drift reproduce the two real episodes.
+    frames = {n: History(1300) for n in CAMERAS}
+    states = {n: History(4500) for n in ARMS}
+    for i in range(3800):
+        add_state(states, .8+i/100, x=.8+i/100)
+    for i in range(1105):
+        for n, offset, drift in (("head", head_offset, 0),
+                                 ("left_wrist", left_offset, .0000081),
+                                 ("right_wrist", right_offset, .0000079)):
+            frames[n].add(1+i/30+offset+i*drift, {"frame_number": i, "bgr": None})
+    sync = Synchronizer(frames, states, cfg["sync"])
+    rows = [sync.sample(1+i/30) for i in range(2, 1100)]
+    assert all(row is not None for row in rows), sync.rejection
+    for row in rows:
+        t = row["timestamp_monotonic_s"]
+        assert t == row["source_timestamps"]["cameras"]["head"]
+        camera_times = list(row["source_timestamps"]["cameras"].values())
+        assert max(camera_times)-min(camera_times) <= .025
+        assert row["action_timestamp_monotonic_s"] == pytest.approx(t+1/30)
+        for side, offset in (("left", 0), ("right", 8)):
+            current = row["source_timestamps"]["states"][side]["tcp"]
+            future = row["source_timestamps"]["actions"][side]["tcp"]
+            assert abs(current-t) <= .04
+            assert abs(future-(t+1/30)) <= .04
+            assert future > t
+            assert row["observation.state"][offset] == current
+            assert row["action"][offset] == future
+    for name in CAMERAS:
+        ids = [row["camera_metadata"][name]["frame_number"] for row in rows]
+        assert len(set(ids)) == len(rows)
 
 
 def wait_mode(cap, mode, timeout=4):
@@ -150,20 +187,22 @@ def test_recording_is_read_only_and_native_data_is_synchronized(cfg, tmp_path):
         assert Path(episode).parts[-2:] == ("把杯子放入托盘", "episode_012")
         assert "task" not in meta and "capture_index" not in meta
         rows = [json.loads(line) for line in (Path(episode)/"samples.jsonl").read_text(encoding="utf-8").splitlines()]
+        processed_ticks = cap.grid
         assert all("task" not in r and "capture_index" not in r and "task_id" not in r for r in rows)
         with pytest.raises(ValueError, match="已存在"):
             cap.record(task="把杯子放入托盘", capture_index=12)
         assert cap.recorder.next_index("把杯子放入托盘") == 13
-        expected = int((meta["end_unix_s"]-meta["start_unix_s"])*cfg["record_hz"]) + 1
-        assert meta["frames"] + meta["dropped_grid_ticks"] == expected
+        assert meta["sampling_timeline"] == "head_camera_timestamps"
+        assert meta["frames"] + meta["dropped_grid_ticks"] == processed_ticks
         assert sum(meta["drop_reasons"].values()) == meta["dropped_grid_ticks"]
-        assert meta["drop_reasons"]["episode_end"] == 1
+        assert meta["drop_reasons"].get("episode_end", 0) <= 1
         assert meta["status"] == "complete"
         assert rows[-1]["action_timestamp_unix_s"] <= meta["end_unix_s"]
         for row in rows:
             stamps = list(row["source_timestamps_unix_s"]["cameras"].values())
             assert max(stamps) - min(stamps) <= cfg["sync"]["camera_span_ms"] / 1000 + 1e-6
-            assert all(abs(stamp - row["timestamp_unix_s"]) <= cfg["sync"]["camera_tolerance_ms"] / 1000 + 1e-6
+            assert row["timestamp_unix_s"] == row["source_timestamps_unix_s"]["cameras"]["head"]
+            assert all(abs(stamp - row["timestamp_unix_s"]) <= cfg["sync"]["camera_span_ms"] / 1000 + 1e-6
                        for stamp in stamps)
     assert not any(r.commands for r in robots.values())
 

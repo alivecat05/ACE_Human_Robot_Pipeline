@@ -32,25 +32,45 @@ class Synchronizer:
         return None
 
     def sample(self, t):
-        """Jointly match RGB; next-step action needs robot feedback, not next-step RGB."""
+        """Use an actual head-camera timestamp; never impose a wall-clock grid.
+
+        Each saved group contains three different, previously unused frames.
+        The pairwise span is the hard limit; there is no extra grid-phase gate.
+        """
         self.rejection = None
+        snapshots = {name: self.cameras[name].snapshot() for name in CAMERAS}
+        span_limit = self.cfg["camera_span_ms"] / 1000
+        reference = CAMERAS[0]
+        near = [x for x in snapshots[reference] if abs(x.t - t) <= span_limit]
+        if not near:
+            return self._reject(f"camera_missing:{reference}")
+        available = [x for x in near if x.value["frame_number"] > self.last_frames.get(reference, -1)]
+        if not available:
+            return self._reject(f"camera_reused:{reference}")
+        anchor = min(available, key=lambda x: abs(x.t - t))
+        t = anchor.t
         candidates = {}
         for name in CAMERAS:
-            near = [x for x in self.cameras[name].snapshot()
-                    if abs(x.t - t) <= self.cfg["camera_tolerance_ms"] / 1000]
+            near = [anchor] if name == reference else [x for x in snapshots[name]
+                                                       if abs(x.t - t) <= span_limit]
             if not near:
-                return self._reject(f"camera_missing:{name}")
+                return self._reject(f"camera_span:{name}" if snapshots[name] else f"camera_missing:{name}")
             candidates[name] = [x for x in near if x.value["frame_number"] > self.last_frames.get(name, -1)]
             if not candidates[name]:
                 return self._reject(f"camera_reused:{name}")
-        # Independent nearest frames can straddle the grid and violate the span
-        # even when a neighbouring combination satisfies the SAME tolerances.
+        # Filter by the physical timing limit first. Prefer continuing frame
+        # sequences, then proximity to the reference, instead of greedily taking
+        # a later frame just because it makes a slightly tighter group.
         def score(group):
             stamps = [x.t for x in group]
-            return max(stamps) - min(stamps), sum(abs(stamp-t) for stamp in stamps)
-        group = min(product(*(candidates[n] for n in CAMERAS)), key=score)
-        if score(group)[0] > self.cfg["camera_span_ms"] / 1000:
+            skipped = sum(x.value["frame_number"] - self.last_frames.get(n, x.value["frame_number"]-1) - 1
+                          for n, x in zip(CAMERAS, group))
+            return skipped, sum(abs(stamp-t) for stamp in stamps), max(stamps)-min(stamps)
+        valid = [group for group in product(*(candidates[n] for n in CAMERAS))
+                 if max(x.t for x in group) - min(x.t for x in group) <= span_limit]
+        if not valid:
             return self._reject("camera_span")
+        group = min(valid, key=score)
         frames = dict(zip(CAMERAS, group))
         states = self._states(t)
         if states is None:

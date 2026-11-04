@@ -4,12 +4,12 @@
   "poll_hz": 100,
   "task": "dual arm manual demonstration",
   "output": "outputs",
+  "foot_pedal": {"enabled": true, "device_id": "VID_0483&PID_5750", "vkey": 119, "debounce_ms": 300},
   "feedback_timeout_s": 0.2,
   "camera_timeout_s": 0.3,
   "home_timeout_s": 30,
   "sync": {
     "delay_ms": 80,
-    "camera_tolerance_ms": 20,
     "camera_span_ms": 25,
     "state_tolerance_ms": 40
   },

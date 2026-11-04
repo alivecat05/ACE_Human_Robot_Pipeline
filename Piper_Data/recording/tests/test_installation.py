@@ -27,7 +27,7 @@ def test_default_install_and_optional_drivers_share_environment(tmp_path, monkey
     assert len(commands) == 1
     assert str(tmp_path / "recording") in commands[0]
     assert str(tmp_path / "postprocessing") + "[export]" in commands[0]
-    assert not any("vendor" in part or "pyrealsense2" in part for part in commands[0])
+    assert not any("vendor" in Path(part).parts or part.startswith("pyrealsense2") for part in commands[0])
     config = tmp_path / "recording/config.json"
     config.write_text('{"user_config": true}')
     commands.clear()
