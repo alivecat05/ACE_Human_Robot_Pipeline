@@ -1,0 +1,37 @@
+{
+  "schema": "human_label.model_sources.v1",
+  "checked_at": "2026-11-07 Asia/Shanghai",
+  "git_revisions": {
+    "NVIDIA-IsaacCapture": {
+      "path": "model/IsaacCapture",
+      "revision": "d10c8818c0d556bc79d4598b343e95bf9e3ed178",
+      "url": "https://github.com/NVIDIA/IsaacCapture.git"
+    },
+    "DINOv3": {
+      "path": "model/dinov3",
+      "revision": "5aa7e93ab42ae3526291f6b4e3fcd22637e03326",
+      "url": "https://github.com/facebookresearch/dinov3.git"
+    }
+  },
+  "verified_files": [
+    {
+      "file": "model/weights/external/detector.pt",
+      "sha256": "5ef3df44e42d2db52d4ffe91f83a22ce9925e2acc9abebf453f2c5d22e380033",
+      "repository_revision": "da6335f47f9806308992d5ae1002a4cc5f7252c2"
+    },
+    {
+      "file": "model/egohand/egohand_s060000.ckpt",
+      "sha256": "f940ecb6e3b73d5bd9e562cff232550e1c072f6c063eb4f705951122b15d8a75",
+      "repository_revision": "a153616c5192e6a8b09dbd302f682093080c5b83"
+    }
+  ],
+  "precision": {
+    "egohand": "bf16 model autocast; fp32 SOMA/MHR geometry"
+  },
+  "adaptations": [
+    "Fixed head optical frame; moving-camera SLAM omitted",
+    "EgoHand context enhancement interpolates only crop boxes in capture grid time (3 s interior, 0.25 s edges); current RGB is inferred, native pose smoothing stays within each capture segment",
+    "Current-frame camera wrist epose exported with PiperCapture 17-column schema and per-side gripper limits; local config.example.json specifies 0.07 m. Raw pinch distance is preserved.",
+    "Corrected SOMA epose rotations using official FK root A.T @ R_native @ A. Native SOMA parameter archives stay intact; camera transforms are saved separately in wrist_epose.npz. Official FK parity max error < 1e-7."
+  ]
+}

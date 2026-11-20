@@ -1,0 +1,274 @@
+"""The only module that calls the official pyAgxArm SDK."""
+import logging
+import time
+
+import numpy as np
+
+from .core import pose_to_vector, vector_to_pose
+from .motion_guard import MotionGuard
+
+# Clear controller latches only; any joint/communication error bits still block recovery.
+RECOVERABLE_STATUSES = (0, 1, 4)  # NORMAL, EMERGENCY_STOP, TARGET_POS_EXCEEDS_LIMIT
+
+
+class RecoverableRobotError(RuntimeError):
+    """A target rejection or operator teaching mode, without motor error bits."""
+    def __init__(self, message, kind="other"):
+        super().__init__(message)
+        self.kind = kind
+
+
+def status_number(value):
+    return int(getattr(value, "value", value))
+
+
+class PiperX:
+    def __init__(self, cfg):
+        from pyAgxArm import AgxArmFactory, ArmModel, create_agx_arm_config
+
+        if cfg["firmware"] not in ("default", "v183", "v188", "v189"):
+            raise ValueError("Set each arm's firmware profile explicitly after checking its firmware")
+        self.cfg = cfg
+        self.clock_offset = time.perf_counter() - time.time()
+        self.robot = AgxArmFactory.create_arm(create_agx_arm_config(
+            robot=ArmModel.PIPER_X, firmeware_version=cfg["firmware"],
+            interface=cfg["interface"], channel=cfg["channel"], bitrate=1_000_000))
+        try:
+            self.robot.connect()
+            self.robot.set_tcp_offset(cfg["tcp_offset"])
+            self.gripper = self.robot.init_effector(self.robot.OPTIONS.EFFECTOR.AGX_GRIPPER)
+            self.motion_guard = MotionGuard(
+                lambda q: pose_to_vector(self.robot.get_flange2tcp_pose(self.robot.fk(list(q))), 0.),
+                self.robot.get_config()["joint_limits"], cfg)
+            self.guard_status = {"limited": False}
+        except Exception:
+            self.robot.disconnect()
+            raise
+
+    def _stamp(self, message):
+        # agx_cando/python-can receive timestamps are Unix seconds.
+        stamp = float(message.timestamp) + self.clock_offset
+        if abs(time.perf_counter() - stamp) > 2:
+            raise RuntimeError("CAN timestamp is not host Unix time, or feedback is stale")
+        return stamp
+
+    def read(self):
+        return self._read_feedback(allow_recovery=False)
+
+    def read_recovery(self):
+        return self._read_feedback(allow_recovery=True)
+
+    def _read_feedback(self, allow_recovery):
+        pose = self.robot.get_tcp_pose()
+        joints = self.robot.get_joint_angles()
+        grip = self.gripper.get_gripper_status()
+        status = self.robot.get_arm_status()
+        if any(x is None for x in (pose, joints, grip, status)):
+            return None
+        code = status_number(status.msg.arm_status)
+        control_mode = status_number(getattr(status.msg, "ctrl_mode", 1))
+        teach_status = status_number(getattr(status.msg, "teach_status", 0))
+        # teach_status may retain the last teaching command after CAN control resumes.
+        teaching = control_mode in (2, 6) or code in (11, 13)
+        # teach_status is a latched command, including in standby after a manual
+        # exit. Current control mode / arm status determine whether teaching is active.
+        recoverable = not status.msg.err_code and (code == 4 or (teaching and code in (0, 11, 13)))
+        if recoverable and not allow_recovery:
+            raise RecoverableRobotError(f"Robot needs recovery: {status.msg.arm_status}; teaching={teaching}",
+                                        kind="teaching" if teaching else "target_limit")
+        if status.msg.err_code or (code != 0 and not recoverable):
+            logging.getLogger(__name__).info("Robot status: %s", status.msg)
+            if code == 1:
+                raise RuntimeError("机械臂处于急停；放稳并支撑机械臂后运行 .\\teleop.cmd recover --supported")
+            raise RuntimeError(f"Robot error: {status.msg.arm_status}, code=0x{status.msg.err_code:04x}")
+        if grip.msg.mode != "width":
+            raise RuntimeError("Gripper must report width in meters")
+        fields = {"tcp": self._stamp(pose), "joints": self._stamp(joints),
+                  "gripper": self._stamp(grip), "status": self._stamp(status)}
+        # SDK 1.0.0 assembles a pose from three CAN frames. Check all parts,
+        # rather than letting one fresh fragment hide two stale fragments.
+        parser = self.robot._parser
+        for name in ("end_pose_xy", "end_pose_zrx", "end_pose_ryrz", "joint_12", "joint_34", "joint_56"):
+            fragment = getattr(parser, name, None)
+            if fragment is None:
+                return None
+            fields[name] = self._stamp(fragment)
+        return max(fields.values()), {
+            "vector": pose_to_vector(list(pose.msg), float(grip.msg.value)),
+            "joints": list(joints.msg), "source_timestamps": fields,
+            "gripper_enabled": bool(grip.msg.foc_status.driver_enable_status),
+            "gripper_status": int(grip.msg.status_code),
+            "arm_status": code, "err_code": int(status.msg.err_code),
+            "teaching": teaching, "ctrl_mode": control_mode, "teach_status": teach_status,
+            "mode_feedback": status_number(getattr(status.msg, "mode_feedback", 0)),
+            "arm_enabled": (bool(self.robot.get_joint_enable_status(255))
+                            if hasattr(self.robot, "get_joint_enable_status") else None),
+            "teach_exit_supported": getattr(self, "cfg", {}).get("firmware") == "v189",
+        }
+
+    def enable(self):
+        self.robot.set_speed_percent(self.cfg["speed_percent"])
+        return self.robot.enable()  # Nonblocking; controller keeps checking its watchdogs.
+
+    def recovery_status(self, after=0, timeout=3):
+        deadline = time.perf_counter() + timeout
+        while time.perf_counter() < deadline:
+            status = self.robot.get_arm_status()
+            if status and status.timestamp > after and -.05 <= time.time() - status.timestamp <= .15:
+                return status.msg
+            time.sleep(.01)
+        raise TimeoutError("恢复检查未收到新鲜机器人状态")
+
+    def recover(self):
+        status = self.recovery_status()
+        if status.err_code or status.arm_status.value not in RECOVERABLE_STATUSES:
+            raise RuntimeError(f"存在其他故障，不能恢复：{status.arm_status}, code=0x{status.err_code:04x}")
+        if status.arm_status.value == 0:
+            return "状态正常，无需恢复"
+        sent = time.time()
+        self.robot.reset()  # Cuts motor power; CLI requires supported arms. Never enables or moves.
+        deadline = time.perf_counter() + 3
+        while time.perf_counter() < deadline:
+            status = self.recovery_status(after=sent, timeout=max(.01, deadline-time.perf_counter()))
+            if status.err_code or status.arm_status.value not in RECOVERABLE_STATUSES:
+                raise RuntimeError(f"恢复后状态异常：{status.arm_status}, code=0x{status.err_code:04x}")
+            if status.arm_status.value == 0:
+                return "控制器故障已清除；未发送使能或运动命令"
+            time.sleep(.02)
+        raise TimeoutError("控制器故障仍未清除；请检查物理急停和控制器状态")
+
+    def send(self, vector):
+        self.send_pose(vector)
+        self.send_gripper(vector[7])
+
+    def constrain_target(self, vector, state, dt):
+        if not self.cfg.get("joint_guard_enabled", False):
+            return list(vector), {"limited": False}
+        target, self.guard_status = self.motion_guard.apply(vector, state, dt)
+        return target, self.guard_status
+
+    def send_pose(self, vector):
+        flange = self.robot.get_tcp2flange_pose(vector_to_pose(vector))
+        self.robot.move_p(list(flange))
+
+    def set_motion_speed(self, percent):
+        self.robot.set_speed_percent(percent)
+
+    def send_gripper(self, width):
+        self.gripper.move_gripper_m(float(width), force=self.cfg["gripper_force_n"])
+
+    def move_home(self, joints):
+        self.robot.set_speed_percent(self.cfg["reset_speed_percent"])
+        self.robot.move_j(list(joints))
+
+    def cartesian_start_issue(self, joints):
+        if np.asarray(joints).shape != (6,) or not np.isfinite(joints).all():
+            return "Cartesian control requires six finite measured joint angles"
+        # SDK presets are not active limits unless explicitly enabled. A joint
+        # on a boundary can move back into range; do not reserve a 2-degree band.
+        if not self.robot.get_joint_limits_enabled():
+            return ""
+        limits = self.robot.get_config()["joint_limits"]
+        for index, angle in enumerate(joints, 1):
+            low, high = limits[f"joint{index}"]
+            if not low <= angle <= high:
+                return f"J{index}={np.rad2deg(angle):.1f}deg outside enabled software limits"
+        return ""
+
+    def hold(self, joints):
+        self._validate_hold_joints(joints)
+        self.robot.move_j(list(joints))
+
+    def _validate_hold_joints(self, joints):
+        if np.asarray(joints).shape != (6,) or not np.isfinite(joints).all():
+            raise ValueError("保持位置需要六个有效的实测关节角")
+        # Only an enabled SDK software limit clamps move_j. Presets alone are not active limits.
+        # Keep fresh measured angles unchanged; never disable limits or clamp a hold target.
+        if self.robot.get_joint_limits_enabled():
+            limits = self.robot.get_config()["joint_limits"]
+            for index, angle in enumerate(joints, 1):
+                low, high = limits[f"joint{index}"]
+                if not low <= angle <= high:
+                    raise ValueError(f"机械臂实测 J{index}={angle:.4f} rad 超出已启用的软件限位"
+                                     f" [{low:.4f}, {high:.4f}]；无法原位接管")
+
+    def exit_teaching(self, joints):
+        """Explicit v189 seamless exit; never reset, disable, replay or home."""
+        if self.cfg["firmware"] != "v189":
+            raise ValueError("当前仅支持 v189 固件的无断电退出示教；请先使用本体退出，软件不会自动 reset")
+        self._validate_hold_joints(joints)  # Validate before leaving compliant teaching mode.
+        from pyAgxArm.protocols.can_protocol.msgs.piper.default.transmit.arm_motion_ctrl import ArmMsgMotionCtrl
+        self.robot._send_msg(ArmMsgMotionCtrl(track_ctrl=6, grag_teach_ctrl=2))
+        self.robot.move_j(list(joints))
+
+    def stop(self):
+        self.robot.electronic_emergency_stop()
+
+    def close(self):
+        self.robot.disconnect()
+
+
+class MockPiperX:
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.vector = pose_to_vector([.3, 0, .3, 0, 0, 0], .04)
+        self.joints = [0.] * 6
+
+    def read(self):
+        t = time.perf_counter()
+        return t, {"vector": list(self.vector), "joints": list(self.joints),
+                   "source_timestamps": dict.fromkeys(("tcp", "joints", "gripper", "status"), t),
+                   "arm_status": 0, "err_code": 0, "teaching": False,
+                   "ctrl_mode": 1, "mode_feedback": 1, "arm_enabled": True,
+                   "teach_exit_supported": True}
+
+    def read_recovery(self):
+        return self.read()
+
+    def enable(self):
+        return True
+
+    def send(self, vector):
+        self.vector = list(vector)
+
+    def constrain_target(self, vector, state, dt):
+        return list(vector), {"limited": False}
+
+    def send_pose(self, vector):
+        self.vector[:7] = list(vector[:7])
+
+    def set_motion_speed(self, percent):
+        pass
+
+    def send_gripper(self, width):
+        self.vector[7] = float(width)
+
+    def move_home(self, joints):
+        self.joints = list(joints)
+        self.vector = pose_to_vector([.3, 0, .3, 0, 0, 0], self.vector[7])
+
+    def hold(self, joints):
+        self.joints = list(joints)
+
+    def exit_teaching(self, joints):
+        self.hold(joints)
+
+    def cartesian_start_issue(self, joints):
+        return ""
+
+    def stop(self):
+        pass
+
+    def close(self):
+        pass
+
+
+def validate_vector(vector, cfg, *, check_workspace=True):
+    array = np.asarray(vector)
+    if array.shape != (8,) or not np.isfinite(array).all():
+        raise ValueError("Invalid robot target")
+    if ((check_workspace and (np.any(array[:3] < cfg["workspace_min"])
+                             or np.any(array[:3] > cfg["workspace_max"])))
+            or not 0 <= array[7] <= cfg["gripper_max_m"]):
+        raise ValueError("Target outside configured workspace/gripper limits")
+

@@ -1,0 +1,4 @@
+# EgoHand geometry, export, video validation and tests; GPU runtime is separate.
+numpy>=2,<3
+scipy>=1.13,<2
+opencv-python-headless==4.11.0.86
